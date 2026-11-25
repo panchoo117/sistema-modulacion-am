@@ -1,0 +1,117 @@
+"""AM simulation: time/frequency views and channel impairments.
+
+Run with: python am_simulation.py
+Dependencies: numpy, scipy, matplotlib (see requirements.txt).
+The script saves a four-panel figure and prints measured SNR values.
+"""
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.fft import rfft, rfftfreq
+from scipy.signal import butter, sosfiltfilt
+
+
+OUTPUT_DIR = Path(__file__).resolve().parent
+FS = 100_000              # samples/second
+DURATION = 0.05            # seconds
+MESSAGE_FREQUENCY = 200    # Hz
+CARRIER_FREQUENCY = 5_000  # Hz
+MODULATION_INDEX = 0.7     # keep <= 1 to avoid overmodulation
+RNG_SEED = 12
+
+
+def lowpass(signal: np.ndarray, cutoff_hz: float, fs: float) -> np.ndarray:
+    """Zero-phase Butterworth low-pass filter used by the coherent receiver."""
+    sos = butter(5, cutoff_hz, btype="lowpass", fs=fs, output="sos")
+    return sosfiltfilt(sos, signal)
+
+
+def snr_db(reference: np.ndarray, estimate: np.ndarray) -> float:
+    """SNR in dB after removing any DC offset from the error."""
+    error = reference - estimate
+    error = error - np.mean(error)
+    return float(10 * np.log10(np.mean(reference**2) / np.mean(error**2)))
+
+
+def spectrum(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return a one-sided amplitude spectrum."""
+    window = np.hanning(len(signal))
+    values = np.abs(rfft(signal * window)) * 2 / np.sum(window)
+    frequencies = rfftfreq(len(signal), 1 / fs)
+    return frequencies, values
+
+
+def main() -> None:
+    rng = np.random.default_rng(RNG_SEED)
+    time = np.arange(int(FS * DURATION)) / FS
+    message = np.cos(2 * np.pi * MESSAGE_FREQUENCY * time)
+    carrier = np.cos(2 * np.pi * CARRIER_FREQUENCY * time)
+
+    # Conventional AM with carrier: s(t) = [1 + mu*m(t)] cos(2*pi*fc*t).
+    modulated = (1 + MODULATION_INDEX * message) * carrier
+
+    # Channel cases: additive white noise, mild nonlinear distortion, and attenuation.
+    noisy = modulated + rng.normal(0, 0.22, len(time))
+    distorted = modulated + 0.12 * modulated**3
+    attenuated = 0.45 * modulated
+
+    # Synchronous demodulation: mix down, low-pass, then remove the carrier's DC term.
+    def demodulate(received: np.ndarray) -> np.ndarray:
+        baseband = lowpass(2 * received * carrier, 1_000, FS)
+        return (baseband - np.mean(baseband)) / MODULATION_INDEX
+
+    recovered = {
+        "Sin canal": demodulate(modulated),
+        "Ruido": demodulate(noisy),
+        "Distorsión": demodulate(distorted),
+        "Atenuación": demodulate(attenuated),
+    }
+    # Normalize the attenuated output to expose its shape separately from its gain loss.
+    recovered["Atenuación (ganancia corregida)"] = recovered["Atenuación"] / 0.45
+
+    # Align the reference and estimates by removing small filter edge transients.
+    valid = slice(int(0.005 * FS), int(0.045 * FS))
+    print("AM: índice de modulación = {:.2f}".format(MODULATION_INDEX))
+    print("SNR de reconstrucción (ventana central):")
+    for label in ("Sin canal", "Ruido", "Distorsión", "Atenuación"):
+        print(f"  {label:12s}: {snr_db(message[valid], recovered[label][valid]):6.2f} dB")
+
+    # Four readable views: message, AM envelope, channel comparison, and spectrum.
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7), constrained_layout=True)
+    view = time < 0.012
+    axes[0, 0].plot(time[view] * 1e3, message[view], color="#176B87")
+    axes[0, 0].set(title="Señal de información", xlabel="Tiempo (ms)", ylabel="Amplitud")
+
+    axes[0, 1].plot(time[view] * 1e3, modulated[view], color="#7A5195", lw=0.8)
+    axes[0, 1].plot(time[view] * 1e3, 1 + MODULATION_INDEX * message[view], "--", color="#EF5675")
+    axes[0, 1].plot(time[view] * 1e3, -(1 + MODULATION_INDEX * message[view]), "--", color="#EF5675")
+    axes[0, 1].set(title="AM en el tiempo y su envolvente", xlabel="Tiempo (ms)", ylabel="Amplitud")
+
+    for label, color in (("Sin canal", "#176B87"), ("Ruido", "#EF5675"),
+                         ("Distorsión", "#FFA600"), ("Atenuación", "#7A5195")):
+        axes[1, 0].plot(time[valid] * 1e3, recovered[label][valid], label=label, lw=1)
+    axes[1, 0].plot(time[valid] * 1e3, message[valid], "k--", label="Mensaje original", lw=1.2)
+    axes[1, 0].set(title="Mensaje recuperado", xlabel="Tiempo (ms)", ylabel="Amplitud")
+    axes[1, 0].legend(fontsize=8, ncol=2)
+
+    freq, magnitude = spectrum(modulated, FS)
+    axes[1, 1].plot(freq / 1e3, magnitude, color="#176B87")
+    axes[1, 1].set_xlim(0, 10)
+    axes[1, 1].set(title="Espectro de la señal AM", xlabel="Frecuencia (kHz)", ylabel="Amplitud")
+    axes[1, 1].axvline(CARRIER_FREQUENCY / 1e3, color="#EF5675", ls=":", lw=1)
+    axes[1, 1].text(CARRIER_FREQUENCY / 1e3 + 0.12, axes[1, 1].get_ylim()[1] * 0.8,
+                    "portadora", color="#EF5675", fontsize=9)
+
+    for ax in axes.flat:
+        ax.grid(True, alpha=0.25)
+    fig.suptitle("Sistema de modulación en amplitud (AM)", fontsize=15)
+    output = OUTPUT_DIR / "am_resultados.png"
+    fig.savefig(output, dpi=180)
+    print(f"\nGráfica guardada en: {output}")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
